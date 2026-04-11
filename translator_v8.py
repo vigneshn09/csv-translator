@@ -1,7 +1,38 @@
 """
 Chartink Screener → Python/Pandas Translation Engine
 ======================================================
-Version : 8.0
+Version : 8.1
+
+Changes in v8.1 (from v8.0) — targeted patch per multi-AI audit:
+  BUG-3 FIX: Leading zeros in numeric literals (01, 06, 07 → 1, 6, 7)
+              Applied as early global pass before all other steps.
+  BUG-4 FIX: Percent sign in numeric literals (100% → 100)
+              Applied as early global pass before all other steps.
+  BUG-7 FIX: Missing fundamental field mappings added:
+              - bse value in lakhs → df['bse_value_lakhs']
+              - advance given by bank → df['advances_by_bank']
+              - return on net worth percentage → df['roe']  (was partial-match broken)
+              - eps after extraordinary items diluted → df['eps_diluted']
+              Dictionary keys ordered longest-first in critical zones.
+  BUG-2 FIX: [qr]/[yr]/[ttm] bracket suffixes on fundamental fields now mapped:
+              operating profit margin[qr] → df['opm_q'], etc.
+              Generic pass: any remaining df['xxx'][qr/yr/ttm] → df['xxx_q/_yr/_ttm']
+  BUG-8 FIX: Nested wma/ema of already-translated indicator expressions:
+              wma(ta_rsi(...), N) → ta_wma(ta_rsi(...), N)
+              ema(ta_rsi(...), N) → ta_ema(ta_rsi(...), N)
+              Extended Step 8a to cover these patterns.
+  BUG-9 FIX: true range(N) vs avg true range(N) disambiguation:
+              avg true range(14) → ta_atr(df,14)  [unchanged]
+              true range(14) (no avg) → ta_tr(df).rolling(14).max()
+  BUG-6 FIX: WaveTrend bare object not unwrapped before comparison:
+              Post-wavetrend pass appends .wt1 to any bare ta_wavetrend(...)
+              not already followed by .wt1 or .wt2.
+  BUG-1 FIX: Nested indicator inside max()/min() produced fake column name.
+              Post-indicator pass re-runs rolling max/min on already-translated
+              expressions including nested ta_xxx(...).wt1 and compound expressions.
+  BUG-5 FIX: Placeholder leak — shift tag resolution refactored to wrap the
+              resolved expression in parens before appending .shift(N), preventing
+              the tag from being used as a dict key substring.
 
 Changes in v8.0 (from v7.1):
   1. CRITICAL-1 FIX (516 rows): shift() now wraps full indicator output, not input series.
@@ -190,6 +221,17 @@ def translate(raw):
         if re.search(r'\{[^}]+\}', c):
             c = re.sub(r'\{[^}]+\}', '', c)
 
+        # ── Step 1a: BUG-3 FIX — strip leading zeros from numeric literals ──
+        # Python 3 refuses 01, 06, 07 as integer literals. Chartink allows them.
+        # e.g. net profit variance[yr] > 01 → > 1
+        # IMPORTANT: Use negative lookbehind/lookahead to avoid touching decimals like 0.02
+        c = re.sub(r'(?<![.\d])0+([1-9]\d*)(?!\s*[.\d])\b', r'\1', c)
+
+        # ── Step 1a2: BUG-4 FIX — strip percent sign from numeric literals ──
+        # Chartink allows "100%" as a value; Python treats % as modulo operator.
+        # e.g. net profit[yearly] > 100%  → > 100
+        c = re.sub(r'(\d+)\s*%', r'\1', c)
+
         # ── Step 1b: CRITICAL-8 FIX — Heikin-Ashi tokens before any processing
         # ha-close, ha-open, ha-high, ha-low must be tokenized BEFORE Step 2b
         # (prevents '-' being parsed as subtraction operator)
@@ -252,9 +294,10 @@ def translate(raw):
         # EPS variants
         c = re.sub(r'\bearning\s+per\s+share\[eps\]\b',            "df['eps']",        c, flags=re.I)
         c = re.sub(r'\bearning\s+per\s+share\b',                   "df['eps']",        c, flags=re.I)
-        c = re.sub(r'\beps\s+after\s+extraordinary\s+items\s+diluted\b', "df['eps']",  c, flags=re.I)
-        c = re.sub(r'\beps\s+after\s+extraordinary\s+items\s+basic\b',   "df['eps']",  c, flags=re.I)
-        c = re.sub(r'\beps\s+after\s+extraordinary\s+items\b',     "df['eps']",        c, flags=re.I)
+        # BUG-7 FIX: diluted must map to eps_diluted, not eps — longest-first order
+        c = re.sub(r'\beps\s+after\s+extraordinary\s+items\s+diluted\b', "df['eps_diluted']", c, flags=re.I)
+        c = re.sub(r'\beps\s+after\s+extraordinary\s+items\s+basic\b',   "df['eps']",         c, flags=re.I)
+        c = re.sub(r'\beps\s+after\s+extraordinary\s+items\b',           "df['eps']",         c, flags=re.I)
         c = re.sub(r'\bttm\s+eps\b',                               "df['eps_ttm']",    c, flags=re.I)
         c = re.sub(r'\bprev\s+year\s+eps\b',                       "df['eps_prev']",   c, flags=re.I)
 
@@ -291,9 +334,10 @@ def translate(raw):
         c = re.sub(r'\bprice\s+to\s+book\s+value\b',              "df['pb']",              c, flags=re.I)
 
         # Margin / profitability
-        c = re.sub(r'\boperating\s+profit\s+margin\[(?:yr|annual)\]', "df['opm_yr']",  c, flags=re.I)
-        c = re.sub(r'\boperating\s+profit\s+margin\b',             "df['opm']",           c, flags=re.I)
-        c = re.sub(r'\bttm\s+operating\s+profit\s+margin\b',      "df['ttm_opm']",       c, flags=re.I)
+        c = re.sub(r'\boperating\s+profit\s+margin\[(?:qr|quarter|q)\]', "df['opm_q']",   c, flags=re.I)
+        c = re.sub(r'\boperating\s+profit\s+margin\[(?:yr|annual)\]',    "df['opm_yr']",  c, flags=re.I)
+        c = re.sub(r'\boperating\s+profit\s+margin\b',                   "df['opm']",     c, flags=re.I)
+        c = re.sub(r'\bttm\s+operating\s+profit\s+margin\b',             "df['ttm_opm']", c, flags=re.I)
         c = re.sub(r'\bttm\s+operating\s+profit\b',                "df['ttm_op']",        c, flags=re.I)
         c = re.sub(r'\bttm\s+net\s+profit\s+variance\b',           "df['ttm_np_var']",    c, flags=re.I)
         c = re.sub(r'\bttm\s+gross\s+profit\s+margin\b',           "df['ttm_gpm']",       c, flags=re.I)
@@ -338,6 +382,14 @@ def translate(raw):
 
         # ── Step 2b-extra: Additional fundamental fields (CRITICAL-2 FIX) ──
         # Fields not in original v7.1 — add before time-shift step
+        # BUG-7 FIX: New missing fields — ordered longest-first within each group
+        # to prevent partial matches eating the start of a longer phrase.
+        c = re.sub(r'\badvance(?:s)?\s+given\s+by\s+bank\b',       "df['advances_by_bank']",    c, flags=re.I)
+        c = re.sub(r'\bbse\s+value\s+in\s+lakhs\b',                 "df['bse_value_lakhs']",     c, flags=re.I)
+        # "return on net worth percentage" must come BEFORE "return on net worth" / "net worth"
+        c = re.sub(r'\breturn\s+on\s+net\s+worth\s+percentage\b',   "df['roe']",                 c, flags=re.I)
+        c = re.sub(r'\beps\s+after\s+extraordinary\s+items\s+diluted\b', "df['eps_diluted']",    c, flags=re.I)
+        c = re.sub(r'\beps\s+after\s+extraordinary\s+items\s+basic\b',   "df['eps']",            c, flags=re.I)
         c = re.sub(r'\bgross\s+profit\s+margin\b',          "df['gross_profit_margin']", c, flags=re.I)
         c = re.sub(r'\bopm\[(?:qr|quarter|q)\]',            "df['opm_q']",               c, flags=re.I)
         c = re.sub(r'\bopm\[(?:yr|annual)\]',               "df['opm_yr']",              c, flags=re.I)
@@ -364,6 +416,37 @@ def translate(raw):
         c = re.sub(r'\broa\b',                               "df['roa']",                 c, flags=re.I)
         c = re.sub(r'\beps\b',                               "df['eps']",                 c, flags=re.I)
         c = re.sub(r'\bpe\b',                                "df['pe']",                  c, flags=re.I)
+
+        # ── BUG-2 FIX: Generic [qr]/[yr]/[ttm] suffix cleanup ─────────────
+        # After all named substitutions, any remaining bare "field[qr]" or
+        # "field[yr]" pattern that slipped through still has bracket suffixes
+        # that Python cannot parse as valid syntax.
+        # Pattern: any word-chars immediately followed by [qr], [yr], [ttm], etc.
+        # → convert to underscore suffix: opm[qr] → opm_q, opm[yr] → opm_yr
+        # Also handle df['col'][suffix] artifacts.
+        def _bracket_suffix(m):
+            col   = m.group(1)
+            sfx   = m.group(2).lower()
+            mapping = {
+                'qr': 'q', 'q': 'q', 'quarter': 'q',
+                'yr': 'yr', 'annual': 'yr', 'yearly': 'yr',
+                'ttm': 'ttm', 'mt': 'ttm',
+            }
+            mapped = mapping.get(sfx, sfx)
+            return f"{col}_{mapped}"
+
+        # Case 1: operating profit margin[qr] (plain word before bracket)
+        c = re.sub(
+            r'\b([A-Za-z][A-Za-z0-9_ ]*?)\s*\[(qr|q|quarter|yr|annual|yearly|ttm|mt)\]',
+            lambda m: f"df['{m.group(1).strip().replace(' ', '_')}_{({'qr':'q','q':'q','quarter':'q','yr':'yr','annual':'yr','yearly':'yr','ttm':'ttm','mt':'ttm'}.get(m.group(2).lower(), m.group(2).lower()))}']",
+            c, flags=re.I
+        )
+        # Case 2: df['col'][qr] artifact → df['col_q']
+        c = re.sub(
+            r"df\['([^']+)'\]\[(qr|q|quarter|yr|annual|yearly|ttm|mt)\]",
+            lambda m: f"df['{m.group(1)}_{({'qr':'q','q':'q','quarter':'q','yr':'yr','annual':'yr','yearly':'yr','ttm':'ttm','mt':'ttm'}.get(m.group(2).lower(), m.group(2).lower()))}']",
+            c, flags=re.I
+        )
 
         # ── Step 2c: SMA applied to a series expression ────────────────────
         # sma( ta_xxx(...), N ) → ta_xxx(...).rolling(N).mean()
@@ -433,16 +516,22 @@ def translate(raw):
 
         # Rolling max/min (before sma) — TF-aware
         # Pattern: max(N, [tf] field) — strip leading TF prefix inside args too
+        # BUG-1 FIX: If field_str contains '(' it's an untranslated indicator call
+        # (e.g. rsi(14), wavetrend(10,21,4)). Return unchanged so Step 8a handles it
+        # AFTER all indicators have been translated to ta_xxx(...) form.
         def _rolling_max(m):
             per_str = m.group(2).strip()
             field_str = m.group(3).strip()
             # If field_str is already a ta_ call or df[] ref, use it directly
-            if field_str.startswith('ta_') or field_str.startswith('df[') or field_str.startswith('df_'):
+            if field_str.startswith('ta_') or field_str.startswith('df[') or field_str.startswith('df_') or field_str.startswith('('):
                 try:
                     per = int(per_str)
                 except ValueError:
                     return m.group(0)
                 return f"({field_str}).rolling({per}).max()"
+            # BUG-1 FIX: field contains '(' → untranslated indicator → skip now, handle in Step 8a
+            if '(' in field_str:
+                return m.group(0)
             # Strip inner TF prefix
             inner_tf_m = re.match(r'^(daily|weekly|monthly)\s+(.+)$', field_str, re.I)
             if inner_tf_m:
@@ -466,6 +555,9 @@ def translate(raw):
                 except ValueError:
                     return m.group(0)
                 return f"({field_str}).rolling({per}).min()"
+            # BUG-1 FIX: field contains '(' → untranslated indicator → skip now
+            if '(' in field_str:
+                return m.group(0)
             inner_tf_m = re.match(r'^(daily|weekly|monthly)\s+(.+)$', field_str, re.I)
             if inner_tf_m:
                 tf = inner_tf_m.group(1).lower()
@@ -563,9 +655,12 @@ def translate(raw):
         c = re.sub(r'\b(?:(daily|weekly|monthly)\s+)?adx\s*\(\s*(\d+)\s*\)',
                    _adx_fn('ta_adx'), c, flags=re.I)
 
-        # ATR — MEDIUM-1 FIX: "true range" (no period/avg) → ta_tr; "avg true range" → ta_atr
-        c = re.sub(r'\b(?:avg\s+|average\s+)?true\s+range\s*\(\s*(\d+)\s*\)',
+        # ATR — BUG-9 FIX: "avg true range(N)" → ta_atr; bare "true range(N)" → ta_tr rolling max
+        # Must check for "avg" BEFORE the general pattern. Order matters critically here.
+        c = re.sub(r'\b(?:avg|average)\s+true\s+range\s*\(\s*(\d+)\s*\)',
                    lambda m: f"ta_atr(df,{int(m.group(1))})", c, flags=re.I)
+        c = re.sub(r'\btrue\s+range\s*\(\s*(\d+)\s*\)',
+                   lambda m: f"ta_tr(df).rolling({int(m.group(1))}).max()", c, flags=re.I)
         c = re.sub(r'\btrue\s+range\b(?!\s*\()',
                    "ta_tr(df)", c, flags=re.I)
 
@@ -708,9 +803,11 @@ def translate(raw):
             lambda m: _cross(m, 'below'), c, flags=re.I
         )
 
-        # ── Step 8a: Post-indicator rolling max/min cleanup ────────────────
-        # Handle max(N, ta_indicator(...)) patterns that couldn't be resolved in Step 7
+        # ── Step 8a: Post-indicator rolling max/min + nested MA cleanup ──────
+        # BUG-1: Handle max(N, ta_indicator(...)) patterns that couldn't be resolved in Step 7
         # because the inner expression was not yet translated then.
+        # BUG-8: Handle wma(ta_xxx(...), N), ema(ta_xxx(...), N) — nested indicator inside MA.
+        # Extended to also catch compound expressions like ta_wavetrend(...).wt1
         def _post_rolling(func):
             def _inner(m):
                 per_str = m.group(1).strip()
@@ -721,10 +818,39 @@ def translate(raw):
                     return m.group(0)
                 return f"({expr}).rolling({per}).{func}()"
             return _inner
-        c = re.sub(r'\bmax\s*\(\s*(\d+)\s*,\s*(ta_\w+\([^)]*\))\s*\)', _post_rolling('max'), c, flags=re.I)
-        c = re.sub(r'\bmin\s*\(\s*(\d+)\s*,\s*(ta_\w+\([^)]*\))\s*\)', _post_rolling('min'), c, flags=re.I)
-        c = re.sub(r'\bmax\s*\(\s*(\d+)\s*,\s*(df(?:_\w+)?\[\'[^\']+\'\])\s*\)', _post_rolling('max'), c, flags=re.I)
-        c = re.sub(r'\bmin\s*\(\s*(\d+)\s*,\s*(df(?:_\w+)?\[\'[^\']+\'\])\s*\)', _post_rolling('min'), c, flags=re.I)
+
+        # Compound ta_ expressions (e.g. ta_wavetrend(...).wt1, ta_rsi(...).shift(1))
+        _compound_ta = r'ta_\w+\([^)]*\)(?:\.\w+(?:\([^)]*\))?)*'
+        # Simple df[...] refs
+        _df_ref = r"df(?:_\w+)?\['[^']+'\](?:\.\w+\([^)]*\))*"
+
+        for func in ('max', 'min'):
+            c = re.sub(rf'\b{func}\s*\(\s*(\d+)\s*,\s*({_compound_ta})\s*\)', _post_rolling(func), c, flags=re.I)
+            c = re.sub(rf'\b{func}\s*\(\s*(\d+)\s*,\s*({_df_ref})\s*\)', _post_rolling(func), c, flags=re.I)
+
+        # BUG-8 FIX: sma/ema/wma wrapping an already-translated indicator expression
+        # e.g. wma(ta_rsi(df['close'],9), 21) → ta_wma(ta_rsi(df['close'],9), 21)
+        for ma_fn in ('sma', 'ema', 'wma'):
+            ta_fn = f'ta_{ma_fn}'
+            c = re.sub(
+                rf'\b{ma_fn}\s*\(\s*({_compound_ta})\s*,\s*(\d+)\s*\)',
+                lambda m, f=ta_fn: f"{f}({m.group(1)},{int(m.group(2))})",
+                c, flags=re.I
+            )
+            c = re.sub(
+                rf'\b{ma_fn}\s*\(\s*({_df_ref})\s*,\s*(\d+)\s*\)',
+                lambda m, f=ta_fn: f"{f}({m.group(1)},{int(m.group(2))})",
+                c, flags=re.I
+            )
+
+        # BUG-6 FIX: WaveTrend bare object not unwrapped before comparison/shift.
+        # ta_wavetrend(...) without .wt1 or .wt2 is not a Series — append .wt1 (momentum line).
+        # Must run AFTER all indicator translation so all ta_wavetrend calls are present.
+        c = re.sub(
+            r'(ta_wavetrend\([^)]*\))(?!\.wt[12])',
+            r'\1.wt1',
+            c
+        )
 
         # ── Step 8b: Reinforced SMA/EMA/WMA fallback ────────────────────────
         c = re.sub(r'\bsma\s*\(\s*df\[\'(\w+)\'\]\s*,\s*(\d+)\s*\)',
@@ -754,11 +880,12 @@ def translate(raw):
 
         def _resolve_shift(m):
             n, tf, expr = m.group(1), m.group(2), m.group(3).strip()
+            # BUG-5 FIX: Always wrap the resolved expression in parens before .shift(N)
+            # to prevent the tag from being baked into a column name substring.
             if tf in ('weekly', 'monthly'):
-                dfname = 'df_weekly' if tf == 'weekly' else 'df_monthly'
-                return f"{expr}.shift({n}).reindex(df.index, method='ffill')"
+                return f"({expr}).shift({n}).reindex(df.index, method='ffill')"
             else:
-                return f"{expr}.shift({n})"
+                return f"({expr}).shift({n})"
 
         # Match __SN_TF__ followed by a ta_ function call
         c = re.sub(
@@ -1149,7 +1276,7 @@ def main():
             existing[r.get('original_code','')] = r
 
     print("="*60)
-    print("  Chartink Translation Engine v8.0")
+    print("  Chartink Translation Engine v8.1")
     print("="*60)
     print(f"  Input    : {len(rows)} screeners")
     print(f"  Existing : {len(existing)} cached (will retranslate for direction column)")
@@ -1207,7 +1334,7 @@ def main():
         f.write(INDICATOR_LIB)
 
     print("\n"+"="*60)
-    print("  Translation Complete — v7.0")
+    print("  Translation Complete — v8.1")
     print(f"  BULLISH  : {stats.get('BULLISH',0)}")
     print(f"  BEARISH  : {stats.get('BEARISH',0)}")
     print(f"  NEUTRAL  : {stats.get('NEUTRAL',0)}")
