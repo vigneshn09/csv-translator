@@ -175,6 +175,8 @@ def translate(raw):
         def _crore(m):
             return str(int(float(m.group(1)) * 10_000_000))
         c = re.sub(r'(\d+(?:\.\d+)?)\s+crore\b', _crore, c, flags=re.I)
+        # Also handle 'cr' abbreviation: "1000 cr" -> "10000000000"
+        c = re.sub(r'(\d+(?:\.\d+)?)\s+cr\b', _crore, c, flags=re.I)
 
         # Step 1b: Heikin-Ashi tokens
         c = re.sub(r'\bha[-_]close\b', '__HA_CLOSE__', c, flags=re.I)
@@ -272,6 +274,8 @@ def translate(raw):
         c = re.sub(r'\bworking\s+capital\b',          "df['working_capital']",    c, flags=re.I)
         c = re.sub(r'\bretained\s+earnings\b',        "df['retained_earnings']",  c, flags=re.I)
         c = re.sub(r'\bgoodwill\b',                   "df['goodwill']",           c, flags=re.I)
+        c = re.sub(r'\bgross\s+block\b',               "df['gross_block']",        c, flags=re.I)
+        c = re.sub(r'\bnet\s+block\b',                 "df['net_block']",          c, flags=re.I)
         c = re.sub(r'\bshare\s+capital\b',            "df['share_capital']",      c, flags=re.I)
         c = re.sub(r'\breserves\b',                   "df['reserves']",           c, flags=re.I)
         c = re.sub(r'\btotal\s+number\b',             "df['shares_outstanding']", c, flags=re.I)
@@ -411,6 +415,13 @@ def translate(raw):
                    lambda m: f"ta_wma(df['{_f(re.sub(chr(39), '', m.group(2)).strip())}'],{m.group(3)}).shift({m.group(1)})",
                    c)
 
+        # Fix malformed indicator calls missing comma: ema( close 34 ) -> ema( close,34 )
+        # Also handles ema(close50) no space no comma -> ema(close,50)
+        c = re.sub(r'\b(sma|ema|wma)\s*\(\s*(close|open|high|low|volume)\s+(\d+)\s*\)',
+                   r'\1(\2,\3)', c, flags=re.I)
+        c = re.sub(r'\b(sma|ema|wma)\s*\(\s*(close|open|high|low|volume)(\d+)\s*\)',
+                   r'\1(\2,\3)', c, flags=re.I)
+
         # Step 2d: Number literal cleaning
         c = re.sub(r'(\d)([oO]+)\b', lambda m: str(int(m.group(1)) * (10 ** len(m.group(2)))), c)
         c = re.sub(r'\.\s+(\d)', r'.\1', c)
@@ -456,48 +467,63 @@ def translate(raw):
 
         # Step 7: Indicators
 
-        # Rolling max/min -- FIX-A: bail on '(' in field -> deferred to Step 8a
-        def _rolling_max(m):
-            per_str   = m.group(2).strip()
-            field_str = m.group(3).strip()
-            if (field_str.startswith('ta_') or field_str.startswith('df[')
-                    or field_str.startswith('df_') or field_str.startswith('(')):
-                try:    per = int(per_str)
-                except: return m.group(0)
-                return f"({field_str}).rolling({per}).max()"
-            if '(' in field_str:
-                return m.group(0)
-            inner_tf_m = re.match(r'^(daily|weekly|monthly|quarterly|yearly)\s+(.+)$', field_str, re.I)
+        def _resolve_field_for_rolling(field_str, per, func):
+            fs = field_str.strip()
+            # Already translated
+            if (fs.startswith('ta_') or fs.startswith('df[')
+                    or fs.startswith('df_') or fs.startswith('(')):
+                return f"({fs}).rolling({per}).{func}()"
+            # Contains untranslated indicator call -- defer to Step 8a
+            if '(' in fs:
+                return None
+            # FIX: __SN_TF__ shift token e.g. "__S365_daily__ close"
+            shift_m = re.match(r'__S(\d+)_(daily|weekly|monthly|quarterly|yearly)__\s+(.+)$', fs, re.I)
+            if shift_m:
+                n, tf_w, bare = shift_m.group(1), shift_m.group(2).lower(), shift_m.group(3).strip()
+                fld = _f(bare)
+                dfn = _df_for_tf(tf_w)
+                if tf_w in ('weekly', 'monthly', 'quarterly', 'yearly'):
+                    expr = f"({dfn}['{fld}'].shift({n}).reindex(df.index, method='ffill'))"
+                else:
+                    expr = f"df['{fld}'].shift({n})"
+                return f"({expr}).rolling({per}).{func}()"
+            # FIX: arithmetic expression e.g. "daily volume * daily close"
+            if re.search(r'[+\-*/]', fs):
+                def _bare2df(s):
+                    s = re.sub(r'\bdaily\s+', '', s, flags=re.I)
+                    s = re.sub(r'\bweekly\s+close\b',  "df_weekly['close']",  s, flags=re.I)
+                    s = re.sub(r'\bweekly\s+volume\b', "df_weekly['volume']", s, flags=re.I)
+                    s = re.sub(r'\bmonthly\s+close\b', "df_monthly['close']", s, flags=re.I)
+                    s = re.sub(r'\bclose\b',  "df['close']",  s, flags=re.I)
+                    s = re.sub(r'\bvolume\b', "df['volume']", s, flags=re.I)
+                    s = re.sub(r'\bhigh\b',   "df['high']",   s, flags=re.I)
+                    s = re.sub(r'\blow\b',    "df['low']",    s, flags=re.I)
+                    s = re.sub(r'\bopen\b',   "df['open']",   s, flags=re.I)
+                    return s
+                return f"({_bare2df(fs)}).rolling({per}).{func}()"
+            # TF-prefixed bare field or plain bare field
+            inner_tf_m = re.match(r'^(daily|weekly|monthly|quarterly|yearly)\s+(.+)$', fs, re.I)
             if inner_tf_m:
                 tf  = inner_tf_m.group(1).lower()
                 fld = _f(inner_tf_m.group(2))
             else:
                 tf  = 'daily'
-                fld = _f(field_str)
-            try:    per = int(per_str)
+                fld = _f(fs)
+            return f"{_df_for_tf(tf)}['{fld}'].rolling({per}).{func}()"
+
+        def _rolling_max(m):
+            per_str = m.group(2).strip()
+            try: per = int(per_str)
             except: return m.group(0)
-            return f"{_df_for_tf(tf)}['{fld}'].rolling({per}).max()"
+            result = _resolve_field_for_rolling(m.group(3).strip(), per, 'max')
+            return result if result is not None else m.group(0)
 
         def _rolling_min(m):
-            per_str   = m.group(2).strip()
-            field_str = m.group(3).strip()
-            if (field_str.startswith('ta_') or field_str.startswith('df[')
-                    or field_str.startswith('df_') or field_str.startswith('(')):
-                try:    per = int(per_str)
-                except: return m.group(0)
-                return f"({field_str}).rolling({per}).min()"
-            if '(' in field_str:
-                return m.group(0)
-            inner_tf_m = re.match(r'^(daily|weekly|monthly|quarterly|yearly)\s+(.+)$', field_str, re.I)
-            if inner_tf_m:
-                tf  = inner_tf_m.group(1).lower()
-                fld = _f(inner_tf_m.group(2))
-            else:
-                tf  = 'daily'
-                fld = _f(field_str)
-            try:    per = int(per_str)
+            per_str = m.group(2).strip()
+            try: per = int(per_str)
             except: return m.group(0)
-            return f"{_df_for_tf(tf)}['{fld}'].rolling({per}).min()"
+            result = _resolve_field_for_rolling(m.group(3).strip(), per, 'min')
+            return result if result is not None else m.group(0)
 
         c = re.sub(r'\bmax\s*\(\s*(?:(daily|weekly|monthly)\s+)?(\d+)\s*,\s*(.+?)\s*\)',
                    _rolling_max, c, flags=re.I)
